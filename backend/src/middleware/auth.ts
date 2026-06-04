@@ -9,6 +9,7 @@ export interface AuthRequest extends Request {
     role: string;
     first_name: string;
     last_name: string;
+    organization_id: string;
   };
 }
 
@@ -21,7 +22,7 @@ export async function authenticate(req: AuthRequest, res: Response, next: NextFu
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_key') as any;
     const db = getDb();
-    const user = await db.prepare('SELECT id, email, role, first_name, last_name FROM users WHERE id = ?').get(decoded.id) as any;
+    const user = await db.prepare('SELECT id, email, role, first_name, last_name, organization_id FROM users WHERE id = ?').get(decoded.id) as any;
     if (!user) {
       res.status(401).json({ error: 'User not found' });
       return;

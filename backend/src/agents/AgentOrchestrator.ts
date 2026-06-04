@@ -3,6 +3,8 @@ import { SMEAgent } from './SMEAgent';
 import { BehavioralAnalystAgent } from './BehavioralAnalystAgent';
 import { getDb } from '../config/database';
 import { v4 as uuidv4 } from 'uuid';
+import { GraphRunner, InterviewGraph, GraphNode } from './GraphRunner';
+import { GraphService } from '../services/graphService';
 
 export type AgentRole = 'hiring_manager' | 'sme' | 'behavioral_analyst';
 export type InterviewPhase = 'intro' | 'technical' | 'behavioral' | 'complete';
@@ -14,6 +16,7 @@ export interface InterviewState {
   progress: number;
   status: 'waiting' | 'active' | 'paused' | 'completed';
   context: Record<string, any>;
+  organizationId?: string;
 }
 
 export class AgentOrchestrator {
@@ -24,6 +27,8 @@ export class AgentOrchestrator {
   };
   private state: InterviewState;
   private sessionIds: Record<string, string> = {};
+  private graph?: InterviewGraph;
+  private graphRunner?: GraphRunner;
 
   constructor(assessmentId: string, context: Record<string, any>) {
     this.agents = {
@@ -44,7 +49,12 @@ export class AgentOrchestrator {
 
   async loadExistingState(): Promise<boolean> {
     const db = getDb();
-    const assessment = await db.prepare('SELECT status, progress, current_agent, current_phase FROM assessments WHERE id = ?').get(this.state.assessmentId) as any;
+    const assessment = await db.prepare(`
+      SELECT a.status, a.progress, a.current_agent, a.current_phase, jp.organization_id 
+      FROM assessments a 
+      JOIN job_positions jp ON a.job_position_id = jp.id 
+      WHERE a.id = ?
+    `).get(this.state.assessmentId) as any;
     
     if (!assessment || (assessment.status === 'scheduled' && assessment.progress === 0)) return false;
 
@@ -52,6 +62,8 @@ export class AgentOrchestrator {
     this.state.progress = assessment.progress || 0;
     this.state.currentAgent = (assessment.current_agent as AgentRole) || 'hiring_manager';
     this.state.phase = (assessment.current_phase as InterviewPhase) || 'intro';
+    this.state.organizationId = assessment.organization_id;
+    this.state.context.organization_id = assessment.organization_id;
 
     // Load session IDs and histories
     const sessions = await db.prepare('SELECT id, agent_role, conversation_history FROM interview_sessions WHERE assessment_id = ?').all(this.state.assessmentId) as any[];
@@ -65,6 +77,17 @@ export class AgentOrchestrator {
       }
     }
 
+    // Load graph state
+    const graph = await GraphService.getActiveGraphForJob(assessment.job_position_id);
+    if (graph) {
+      this.graph = graph;
+      const graphRun = await GraphService.getGraphRun(this.state.assessmentId);
+      this.graphRunner = new GraphRunner(graph, graphRun ? {
+        currentNodeId: graphRun.current_node_id,
+        traversalLog: graphRun.traversal_log
+      } : undefined);
+    }
+
     return true;
   }
 
@@ -74,6 +97,14 @@ export class AgentOrchestrator {
 
     const db = getDb();
     const now = new Date().toISOString();
+
+    // Ensure defaults exist for the organization
+    if (this.state.organizationId) {
+      const { PromptService } = await import('../services/promptService');
+      const { QuestionBankService } = await import('../services/questionBankService');
+      await PromptService.seedDefaultPrompts(this.state.organizationId);
+      await QuestionBankService.seedDefaultQuestions(this.state.organizationId);
+    }
 
     // Create session records for each agent
     for (const role of ['hiring_manager', 'sme', 'behavioral_analyst'] as AgentRole[]) {
@@ -85,6 +116,21 @@ export class AgentOrchestrator {
 
     await db.prepare(`UPDATE assessments SET status = 'in_progress', started_at = ?, progress = ?, current_agent = ?, current_phase = ? WHERE id = ?`)
       .run(now, this.state.progress, this.state.currentAgent, this.state.phase, this.state.assessmentId);
+
+    // Initialize graph if available
+    const assessment = await db.prepare('SELECT job_position_id FROM assessments WHERE id = ?').get(this.state.assessmentId) as any;
+    const graph = await GraphService.getActiveGraphForJob(assessment.job_position_id);
+    if (graph) {
+      this.graph = graph;
+      this.graphRunner = new GraphRunner(graph);
+      await GraphService.saveGraphRun(this.state.assessmentId, graph.id, this.graphRunner.getState());
+      
+      const startNode = this.graphRunner.getCurrentNode();
+      if (startNode) {
+        this.state.currentAgent = startNode.agentRole;
+        this.state.phase = startNode.phase;
+      }
+    }
 
     const response = await this.agents.hiring_manager.respond(
       'Please introduce yourself and begin the interview.',
@@ -110,6 +156,10 @@ export class AgentOrchestrator {
   }> {
     await this.saveMessage(this.state.currentAgent, 'user', candidateMessage);
 
+    // Module 1.2: Save candidate answer to long-term memory
+    const { VectorService } = await import('../services/vectorService');
+    await VectorService.saveMemory(this.state.currentAgent, this.state.assessmentId, 'answer', candidateMessage, { phase: this.state.phase });
+
     const currentAgent = this.agents[this.state.currentAgent];
     const response = await currentAgent.respond(candidateMessage, this.state.context);
     await this.saveMessage(this.state.currentAgent, 'assistant', response.content);
@@ -117,32 +167,66 @@ export class AgentOrchestrator {
     let agentSwitched = false;
     let isComplete = false;
 
-    // Detect phase transition keywords
-    const shouldSwitch = response.isComplete ||
-      response.content.includes('hand you over to our Technical Expert') ||
-      response.content.includes('Behavioral Analyst will now take over') ||
-      response.content.includes('concludes our assessment');
+    // Phase 2A: Use GraphRunner for transitions
+    if (this.graphRunner) {
+      const nextNode = this.graphRunner.getNextNode({
+        lastResponse: response.content,
+        // TODO: add scores and confidence from agent response when available
+      });
 
-    if (shouldSwitch) {
-      agentSwitched = true;
-      if (this.state.currentAgent === 'hiring_manager') {
-        this.state.currentAgent = 'sme';
-        this.state.phase = 'technical';
-        this.state.progress = 40;
-        await this.addDeliberation('hiring_manager', 'sme', 'Candidate showed strong communication skills and clear career goals. Technical assessment recommended.');
-      } else if (this.state.currentAgent === 'sme') {
-        this.state.currentAgent = 'behavioral_analyst';
-        this.state.phase = 'behavioral';
-        this.state.progress = 70;
-        await this.addDeliberation('sme', 'behavioral_analyst', 'Technical knowledge appears solid. Please assess collaboration style and emotional intelligence.');
-      } else if (this.state.currentAgent === 'behavioral_analyst') {
-        this.state.phase = 'complete';
-        this.state.progress = 100;
-        this.state.status = 'completed';
-        isComplete = true;
-        await this.completeAssessment();
+      if (nextNode && nextNode.id !== this.graphRunner.getState().currentNodeId) {
+        agentSwitched = true;
+        this.state.currentAgent = nextNode.agentRole;
+        this.state.phase = nextNode.phase;
+        
+        if (this.state.phase === 'complete') {
+          this.state.progress = 100;
+          this.state.status = 'completed';
+          isComplete = true;
+          await this.completeAssessment();
+        } else {
+          // Add deliberation between agents if switching
+          const prevNodeId = this.graphRunner.getState().traversalLog.slice(-2)[0];
+          if (this.graph) {
+            const prevNode = this.graph.nodes.find(n => n.id === prevNodeId);
+            if (prevNode) {
+              await this.addDeliberation(prevNode.agentRole, nextNode.agentRole, `Transitioning from ${prevNode.title} to ${nextNode.title}.`);
+            }
+          }
+        }
+        
+        await GraphService.saveGraphRun(this.state.assessmentId, this.graph!.id, this.graphRunner.getState());
       }
     } else {
+      // Fallback to legacy transition logic if no graph
+      const shouldSwitch = response.isComplete ||
+        response.content.includes('hand you over to our Technical Expert') ||
+        response.content.includes('Behavioral Analyst will now take over') ||
+        response.content.includes('concludes our assessment');
+
+      if (shouldSwitch) {
+        agentSwitched = true;
+        if (this.state.currentAgent === 'hiring_manager') {
+          this.state.currentAgent = 'sme';
+          this.state.phase = 'technical';
+          this.state.progress = 40;
+          await this.addDeliberation('hiring_manager', 'sme', 'Candidate showed strong communication skills and clear career goals. Technical assessment recommended.');
+        } else if (this.state.currentAgent === 'sme') {
+          this.state.currentAgent = 'behavioral_analyst';
+          this.state.phase = 'behavioral';
+          this.state.progress = 70;
+          await this.addDeliberation('sme', 'behavioral_analyst', 'Technical knowledge appears solid. Please assess collaboration style and emotional intelligence.');
+        } else if (this.state.currentAgent === 'behavioral_analyst') {
+          this.state.phase = 'complete';
+          this.state.progress = 100;
+          this.state.status = 'completed';
+          isComplete = true;
+          await this.completeAssessment();
+        }
+      }
+    }
+
+    if (!isComplete && !agentSwitched) {
       // Update progress within phase
       if (this.state.phase === 'intro') this.state.progress = Math.min(35, this.state.progress + 8);
       else if (this.state.phase === 'technical') this.state.progress = Math.min(65, this.state.progress + 8);

@@ -4,6 +4,7 @@ import { getDb } from '../config/database';
 import { authenticate, authorize, AuthRequest } from '../middleware/auth';
 import { asyncHandler } from '../middleware/errorHandler';
 import { screenApplication } from '../services/screeningService';
+import { GraphService } from '../services/graphService';
 
 const router = Router();
 
@@ -32,6 +33,10 @@ router.post('/', authenticate, authorize('admin', 'recruiter'), asyncHandler(asy
   await db.prepare(`INSERT INTO job_positions (id, title, department, location, description, requirements, assessment_config, salary_min, salary_max, experience_level, created_by)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .run(id, title, department || '', location || '', description || '', JSON.stringify(requirements || {}), JSON.stringify(assessmentConfig || {}), salaryMin, salaryMax, experienceLevel || 'mid', req.user!.id);
+  
+  // Phase 2A: Create default interview graph for the job
+  await GraphService.createDefaultGraph(id);
+
   const job = await db.prepare('SELECT * FROM job_positions WHERE id = ?').get(id) as any;
   res.status(201).json({
     ...job,

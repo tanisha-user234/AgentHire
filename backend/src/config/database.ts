@@ -210,6 +210,96 @@ export async function initDatabase(): Promise<void> {
       read INTEGER DEFAULT 0,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
+
+    -- Phase 2A: Adaptive Agent Intelligence & Prompt Management
+    
+    CREATE TABLE IF NOT EXISTS interview_graphs (
+      id UUID PRIMARY KEY,
+      job_position_id UUID REFERENCES job_positions(id),
+      graph_config JSONB,         -- node definitions, edge conditions
+      version INTEGER DEFAULT 1,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS interview_graph_runs (
+      id UUID PRIMARY KEY,
+      assessment_id UUID REFERENCES assessments(id),
+      graph_id UUID REFERENCES interview_graphs(id),
+      current_node_id VARCHAR(100),
+      traversal_log JSONB,        -- full path taken through graph
+      branch_decisions JSONB,     -- which forks were taken and why
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Check for pgvector and create extension if available
+    DO $$ 
+    BEGIN 
+      BEGIN
+        CREATE EXTENSION IF NOT EXISTS vector;
+      EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'pgvector extension not available, agent_memory_embeddings will use JSONB for embeddings fallback';
+      END;
+    END $$;
+
+    -- Handle agent_memory_embeddings based on vector support
+    DO $$ 
+    BEGIN 
+      IF EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vector') THEN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_memory_embeddings') THEN
+          CREATE TABLE agent_memory_embeddings (
+            id UUID PRIMARY KEY,
+            agent_role VARCHAR(50),
+            source_assessment_id UUID REFERENCES assessments(id),
+            content_type VARCHAR(50),
+            content TEXT,
+            embedding VECTOR(1536),
+            metadata JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        END IF;
+      ELSE
+        IF NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'agent_memory_embeddings') THEN
+          CREATE TABLE agent_memory_embeddings (
+            id UUID PRIMARY KEY,
+            agent_role VARCHAR(50),
+            source_assessment_id UUID REFERENCES assessments(id),
+            content_type VARCHAR(50),
+            content TEXT,
+            embedding_json JSONB,
+            metadata JSONB,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+        END IF;
+      END IF;
+    END $$;
+
+    CREATE TABLE IF NOT EXISTS prompt_versions (
+      id UUID PRIMARY KEY,
+      organization_id UUID REFERENCES organizations(id),
+      agent_role VARCHAR(50),
+      version_tag VARCHAR(50),
+      prompt_text TEXT,
+      is_published BOOLEAN DEFAULT FALSE,
+      performance_metrics JSONB DEFAULT '{}',
+      created_by UUID REFERENCES users(id),
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS question_bank (
+      id UUID PRIMARY KEY,
+      organization_id UUID REFERENCES organizations(id),
+      category VARCHAR(100),
+      skill VARCHAR(100),
+      difficulty VARCHAR(20),     -- 'entry', 'mid', 'senior', 'expert'
+      question_text TEXT NOT NULL,
+      ideal_answer_rubric TEXT,
+      usage_count INTEGER DEFAULT 0,
+      avg_candidate_score DECIMAL(3,2) DEFAULT 0,
+      discrimination_index DECIMAL(3,2) DEFAULT 0,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 
   console.log('✅ PostgreSQL Database initialized');
